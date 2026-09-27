@@ -6,6 +6,16 @@ version reported by the `status` action.
 
 ## Unreleased
 
+## 1.6.0 - 2026-09-27
+
+- Protocol 1.4: `status.native_confirm` reports `required` or `skip`.
+- Fork opt-in: `contacts/native_confirm.txt` set to `skip` sends a text or
+  image message after a valid `send_nonce` without opening
+  `grokbot-imessage-confirm`. A missing file stays on the native dialog.
+  Nonce TTL, blocklist, group-chat rejection, and image fingerprint checks
+  are unchanged. The FDA wrapper and confirm binary do not need a rebuild.
+- This fork only. Do not contribute the skip-confirm behavior upstream.
+
 ## 1.5.0 - 2026-09-27
 
 - Protocol 1.3: send one outbound image to an individual recipient through the

@@ -259,6 +259,7 @@ Sending is gated at the **helper level** with two layers of protection:
      - Full message text in a scrollable, read-only view
    - **Cancel is the keyboard default.** You must deliberately select **Send** to proceed. Clicking Cancel or waiting 60 seconds aborts the send.
    - This dialog enforces human approval at the macOS level—even a valid nonce requires explicit user confirmation.
+   - Fork opt-in: `contacts/native_confirm.txt` containing `skip` turns the dialog off after a valid nonce. `status.native_confirm` reports `required` (default) or `skip`. See `docs/PROTOCOL.md`.
 
 <!-- Screenshot: docs/images/send-confirm-dialog.png (illustrative; actual dialog appearance may vary by macOS version) -->
 

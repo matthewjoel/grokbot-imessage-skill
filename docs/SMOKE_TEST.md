@@ -158,7 +158,7 @@ confirm `protocol_version` begins with `1` and the installation checks are true.
 2. Grok Bot waits for your explicit approval.
 3. You confirm.
 4. Grok Bot runs `send` with the `send_nonce` from the preview.
-5. **The helper displays a native macOS confirmation dialog** showing the exact recipient and full message text in a scrollable view. Cancel is the keyboard default; deliberately select **Send** to proceed.
+5. **Native confirmation follows `status.native_confirm`.** `required` (default) displays a macOS dialog showing the exact recipient and full message text in a scrollable view. Cancel is the keyboard default; deliberately select **Send** to proceed. `skip` does not display that dialog; the message sends after the chat approval.
 6. You see a confirmation: `sent_at` timestamp and resolved recipient name.
 7. The message appears in Messages.app on your Mac as sent.
 
@@ -184,7 +184,7 @@ source. Use a real individual recipient and a small local JPEG or PNG.
 1. `send_preview` returns `preview.image` with filename, MIME type, size, and sha256.
 2. Grok Bot shows those fields and waits for your approval.
 3. `send` echoes that image object plus the preview nonce.
-4. The native dialog title says **Image Send** and lists the filename, type, size, path, and caption. Cancel is still the default.
+4. If `native_confirm` is `required`, the native dialog title says **Image Send** and lists the filename, type, size, path, and caption. Cancel is still the default. If it is `skip`, no dialog appears.
 5. After you click **Send**, Messages shows the image and then the caption.
 6. A group chat id, a missing file, or a non-image is rejected and nothing is sent.
 

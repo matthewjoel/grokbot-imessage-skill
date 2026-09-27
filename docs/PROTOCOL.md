@@ -2,7 +2,7 @@
 
 This document describes the JSON-based request/response protocol that both Claude Cowork and Grok Bot use to communicate with the macOS helper.
 
-Protocol version: `1.3`
+Protocol version: `1.4`
 
 Clients should call `status` before their first message operation and require a
 compatible `protocol_version`. Minor versions add backward-compatible actions or
@@ -10,6 +10,11 @@ fields; a future major-version mismatch must fail closed with upgrade guidance.
 
 Protocol history:
 
+- `1.4` — `status.native_confirm` reports `required` or `skip`. `skip` is a
+  fork opt-in (`contacts/native_confirm.txt`) that sends after a valid
+  `send_nonce` without the native macOS dialog. The default remains
+  `required`. Nonce TTL, blocklist, group-chat rejection, and image
+  fingerprint checks are unchanged.
 - `1.3` — optional outbound image attachment on `send_preview` / `send`.
   Text-only requests are unchanged. The send nonce binds the image identity
   (path, filename, mime, size, sha256) when an image is present.
@@ -93,7 +98,8 @@ remaining directories under the user-owned bridge root:
 ├── contacts/
 │   ├── blocked_chats.txt             # User-maintained blocklist
 │   ├── allowed_chats.txt             # Standard-mode optional allowlist
-│   └── read_policy.txt                # blocklist or allowlist
+│   ├── read_policy.txt                # blocklist or allowlist
+│   └── native_confirm.txt            # optional: required (default) or skip
 └── nonces/                            # Short-lived send-preview nonces
 ```
 
@@ -150,10 +156,12 @@ On error:
 {"id": "abc123", "action": "status", "params": {}}
 ```
 
-The response includes `helper_version`, `protocol_version`, `bridge_role`,
-`allowed_actions` (sorted, for this role), `code_root`, `bridge_root`,
-`python_version`, policy metadata, and local boolean checks for the database,
-request directories, and native confirmation helper.
+The response includes `helper_version`, `protocol_version`, `native_confirm`
+(`required` or `skip`), `bridge_role`, `allowed_actions` (sorted, for this
+role), `code_root`, `bridge_root`, `python_version`, policy metadata, and
+local boolean checks for the database, request directories, and native
+confirmation helper. `native_confirm` is `required` unless
+`<policy-dir>/native_confirm.txt` opts into `skip` (see `send`).
 
 ---
 
@@ -577,9 +585,22 @@ Image send request:
 }
 ```
 
-**Native macOS confirmation dialog.** After nonce validation succeeds, the helper displays the resolved name, exact recipient address, service, and full message text in a scrollable read-only view. An image send changes the dialog title to say **Image Send** and adds the attachment filename, MIME type, size, and path, plus the caption (or `(no caption)`). Cancel is the keyboard default. The user must deliberately select **Send**; cancelling or waiting 60 seconds aborts the send.
+**Native macOS confirmation dialog (default).** After nonce validation succeeds, the helper displays the resolved name, exact recipient address, service, and full message text in a scrollable read-only view. An image send changes the dialog title to say **Image Send** and adds the attachment filename, MIME type, size, and path, plus the caption (or `(no caption)`). Cancel is the keyboard default. The user must deliberately select **Send**; cancelling or waiting 60 seconds aborts the send. `status.native_confirm` is `required` in this mode.
 
-The confirm helper binary must be rebuilt from `bin/confirm_imessage_send.m` before image sends will proceed. The Python helper refuses an image send when that binary does not contain `IMESSAGE_CONFIRM_IMAGE_V1`, so an old dialog cannot approve an attachment it does not display. Text-only sends still work with a current confirm helper. Rebuilding only the confirm helper does not change the FDA wrapper's CDHash. Re-running `install.sh` also rebuilds the wrapper, which can require granting Full Disk Access again.
+The confirm helper binary must be rebuilt from `bin/confirm_imessage_send.m` before image sends will proceed while confirmation is required. The Python helper refuses an image send when that binary does not contain `IMESSAGE_CONFIRM_IMAGE_V1`, so an old dialog cannot approve an attachment it does not display. Text-only sends still work with a current confirm helper. Rebuilding only the confirm helper does not change the FDA wrapper's CDHash. Re-running `install.sh` also rebuilds the wrapper, which can require granting Full Disk Access again.
+
+**Skip the dialog (fork opt-in).** Create `<policy-dir>/native_confirm.txt` — on a DIY install that is `<bridge-folder>/contacts/native_confirm.txt` — containing `skip` as the first non-comment line:
+
+```text
+# required | skip
+skip
+```
+
+After a valid `send_nonce`, the helper sends without running `grokbot-imessage-confirm`. Chat approval is the human gate. This applies to text and image sends. Nonce TTL, single-use, payload match, blocklist, group-chat rejection, and image fingerprint checks are unchanged. Image staging and the AppleScript send are unchanged. The confirm binary does not need a rebuild for this mode, and an older confirm binary does not block an image send when the dialog is skipped.
+
+Missing file, blank file, `required`, comments-only, an unrecognized value, a symlink, a non-regular file, a file owned by someone else, or a group/world-writable file all stay on `required`. The FDA wrapper builds a minimal environment and does not forward extra variables, so this is a file under the bridge rather than an environment variable. Changing the wrapper would change its CDHash and can force a new Full Disk Access grant.
+
+`status.native_confirm` reports the mode the next request will use. Delete the file or set it back to `required` to restore the dialog.
 
 **Response on success:**
 ```json
@@ -625,8 +646,8 @@ Image sends are different because Messages has to read a file. After the user co
 
 - The `send_nonce` must be present, fresh (within TTL), and match the payload.
 - Nonces are single-use: consumed on first `send` attempt, deleted on any validation failure.
-- Replaying a used nonce, sending without a nonce, or changing the payload after preview all result in rejection before the confirmation dialog appears.
-- After nonce validation, the user must approve via the native macOS dialog.
+- Replaying a used nonce, sending without a nonce, or changing the payload after preview all result in rejection before the confirmation dialog and before Messages is contacted.
+- After nonce validation, the user must approve via the native macOS dialog when `native_confirm` is `required`. When it is `skip`, the helper does not show that dialog.
 - Text-only bodies must be 1–4000 chars with no C0 control bytes other than `\n`, `\r`, `\t`.
 - With an image, `text` may be omitted or empty (caption). A non-empty caption has the same 4000-character rules.
 - One image per send. Supported types: png, jpeg (`.jpg` / `.jpeg`), gif, webp, heic, heif. Max 25 MiB.
@@ -743,7 +764,7 @@ else:
    - If preview fails with "group chat IDs not supported", the recipient is a group—use an individual contact instead.
 3. **Wait for explicit user approval in the AI chat.** Do not proceed without confirmation.
 4. **Issue `send` with the `send_nonce` from step 2.** The `to`, `text`, and `service` must match the preview exactly. For an image, also echo the preview `image` object unchanged.
-5. **The helper will display a native macOS dialog** showing the recipient, service, and message preview. Image sends also show the filename, type, size, and path. The user must click **Send** in this system dialog to complete the send (60-second timeout).
+5. **Finish according to `status.native_confirm`.** `required` (default) displays a native macOS dialog showing the recipient, service, and message. Image sends also show the filename, type, size, and path. The user must click **Send** (60-second timeout). `skip` does not display that dialog; the chat approval in step 3 is the human gate, and the helper sends as soon as `send` validates.
 6. **If the AI chat approval takes >60s,** re-run `send_preview` to mint a fresh nonce. Do this as well if the image file changed after preview.
 7. **Surface `sent.sent_at`, resolved name, and any `sent.image` identity** as confirmation.
 
@@ -763,10 +784,38 @@ System Settings → Privacy & Security → Full Disk Access
 
 ### Updating an existing Mac install
 
+#### Skip the native confirm dialog
+
+This does not require rebuilding `grokbot-imessage-confirm` or the FDA
+wrapper. For `/Users/matthew/imessage-bridge-grok`:
+
+1. Copy this fork's `bin/helper.py` over
+   `/Users/matthew/imessage-bridge-grok/bin/helper.py`.
+2. Create `/Users/matthew/imessage-bridge-grok/contacts/native_confirm.txt`
+   owned by the Messages user, mode `0644` or `0600`, containing:
+
+   ```text
+   skip
+   ```
+
+3. Send a `status` request. `native_confirm` must be `skip` and
+   `helper_version` must be `1.6.0`. The next `send` with a valid nonce
+   does not open "Confirm Grok Bot iMessage Send".
+
+launchd starts the helper per request, so a plist reload is not required.
+Do not re-run `install.sh` for this change. That rebuilds the FDA wrapper
+and can force a new Full Disk Access grant. Leave
+`grokbot-imessage-confirm` in place; skip mode simply does not invoke it.
+
+To turn the dialog back on, delete `native_confirm.txt` or replace `skip`
+with `required`.
+
+#### Image sends while confirmation stays required
+
 Image send ships in this fork's source. It is not applied to a live helper
-until that Mac is updated. For `/Users/matthew/imessage-bridge-grok` (or any
-other checkout), install the new `bin/helper.py`, `bin/send_gate.py`, and
-`bin/confirm_imessage_send.m`, then rebuild **only** the confirm helper:
+until that Mac is updated. If `native_confirm` stays `required`, install the
+new `bin/helper.py`, `bin/send_gate.py`, and `bin/confirm_imessage_send.m`,
+then rebuild **only** the confirm helper:
 
 ```bash
 clang -Wall -Wextra -Werror -fobjc-arc \
@@ -802,7 +851,8 @@ System Settings → Privacy & Security → Automation
 | `send gate: missing nonce` | `send` called without prior `send_preview` | Always call `send_preview` first and pass the returned nonce |
 | `send payload differs from preview` | Body, recipient, service, or image identity changed after preview | Re-run `send_preview` to mint a fresh nonce for the new payload |
 | `image file does not match the previewed attachment` | The file's bytes, type, or size changed after preview | Re-run `send_preview` |
-| `confirmation helper does not support image sends` | `grokbot-imessage-confirm` was not rebuilt | Rebuild the confirm helper; see below |
+| `confirmation helper does not support image sends` | `grokbot-imessage-confirm` was not rebuilt and native confirm is still required | Rebuild the confirm helper, or set `native_confirm.txt` to `skip` if the Mac dialog should stay off |
+| Mac dialog still appears after chat approval | `native_confirm.txt` is missing, not exactly `skip`, or was rejected (symlink, wrong owner, group/world-writable) | Write `skip` as a regular user-owned file and check `status.native_confirm` |
 | Messages decode as empty | `attributedBody` parser failed | Check `control/log.txt` for a byte-count-only parser diagnostic |
 
 ---
