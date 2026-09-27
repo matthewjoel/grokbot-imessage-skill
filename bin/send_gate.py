@@ -155,24 +155,60 @@ def _valid_expiry(value) -> bool:
     )
 
 
-def _preview_hash(to: str, body: str, service: str) -> str:
+def _image_hash_parts(image):
+    """Return the extra hash fields for an outbound image identity.
+
+    ``None`` means a text-only payload and contributes no fields, so
+    existing text nonces stay bound to ``(to, body, service)`` only.
+    """
+    if image is None:
+        return ()
+    if not isinstance(image, dict):
+        raise SendGateError("image identity must be an object")
+    parts = []
+    for key in ("path", "filename", "mime"):
+        value = image.get(key)
+        if not isinstance(value, str) or not value:
+            raise SendGateError(f"image {key} must be a non-empty string")
+        parts.append(value)
+    size = image.get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise SendGateError("image size must be a positive integer")
+    parts.append(str(size))
+    sha256 = image.get("sha256")
+    if not isinstance(sha256, str) or not sha256:
+        raise SendGateError("image sha256 must be a non-empty string")
+    parts.append(sha256)
+    return ("image",) + tuple(parts)
+
+
+def _preview_hash(to: str, body: str, service: str, image=None) -> str:
     """Bind a nonce to its exact payload. Null bytes separate fields
-    so ``('ab', 'c')`` and ``('a', 'bc')`` don't collide."""
+    so ``('ab', 'c')`` and ``('a', 'bc')`` don't collide.
+
+    Text-only hashes are unchanged. When ``image`` is present the hash
+    also covers path, filename, mime, size, and sha256.
+    """
     h = hashlib.sha256()
-    for part in (to, body, service):
+    for part in (to, body, service) + _image_hash_parts(image):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
     return h.hexdigest()
 
 
-def mint_send_nonce(to: str, body: str, service: str) -> str:
+def mint_send_nonce(to: str, body: str, service: str, image=None) -> str:
     """Called from action_send_preview. Persists a nonce record and
     returns the nonce string the client must echo back on send.
     Atomic write via temp file + rename to prevent reap from deleting
-    mid-write records."""
+    mid-write records.
+
+    ``image`` is the outbound attachment identity, or ``None`` for a
+    text-only send. The optional argument keeps text-only callers
+    compatible.
+    """
     nonce = secrets.token_urlsafe(24)  # ~32 chars, URL/filename safe
     record = {
-        "preview_hash": _preview_hash(to, body, service),
+        "preview_hash": _preview_hash(to, body, service, image),
         "expires_at": int(time.time()) + SEND_NONCE_TTL,
     }
     name = f"{nonce}.json"
@@ -197,11 +233,13 @@ def mint_send_nonce(to: str, body: str, service: str) -> str:
     return nonce
 
 
-def consume_send_nonce(nonce, to: str, body: str, service: str) -> None:
+def consume_send_nonce(nonce, to: str, body: str, service: str, image=None) -> None:
     """Called from action_send. Raises SendGateError on any failure;
     deletes the nonce on success so it can't be reused.
 
-    Atomically claims the nonce file to prevent concurrent double-send races."""
+    Atomically claims the nonce file to prevent concurrent double-send races.
+    ``image`` must be the same identity object passed to ``mint_send_nonce``.
+    """
     if not isinstance(nonce, str) or not nonce:
         raise SendGateError("missing nonce; call send_preview first")
     if not _NONCE_RE.match(nonce):
@@ -238,7 +276,12 @@ def consume_send_nonce(nonce, to: str, body: str, service: str) -> None:
                 f"nonce expired (TTL {SEND_NONCE_TTL}s); call send_preview again"
             )
 
-        if _preview_hash(to, body, service) != record.get("preview_hash"):
+        try:
+            actual_hash = _preview_hash(to, body, service, image)
+        except SendGateError:
+            _unlink_at(nonce_fd, claimed)
+            raise
+        if actual_hash != record.get("preview_hash"):
             _unlink_at(nonce_fd, claimed)
             raise SendGateError(
                 "send payload differs from preview; re-preview required"

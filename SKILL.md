@@ -4,10 +4,10 @@ description: >
   Read, search, triage, and send iMessages on macOS via the iMessage helper
   bridge. Use when the user asks to review messages, find messages that need
   a reply, search message history, pull a conversation, compute response-time
-  stats, or send a plain-text iMessage. macOS only—uses an on-device launchd
-  helper to query the Messages SQLite database and AppleScript (osascript) to
-  send outbound messages.
-version: 1.4.8
+  stats, or send a plain-text iMessage or one image attachment to an individual
+  recipient. macOS only—uses an on-device launchd helper to query the Messages
+  SQLite database and AppleScript (osascript) to send outbound messages.
+version: 1.5.0
 ---
 
 # iMessage on macOS — Grok Bot
@@ -21,7 +21,7 @@ Use when the user asks to:
 - Search history for a topic, person, or phrase
 - Pull a specific conversation's recent messages
 - Compute response-time statistics (e.g., "average reply time to Alex over the last 24 hours")
-- Send a plain-text iMessage to an existing contact
+- Send a plain-text iMessage, or one image (with an optional caption), to an individual contact
 
 ## Architecture
 
@@ -259,9 +259,19 @@ Useful for disambiguating before `chat_history` or `send`.
 }
 ```
 
-**CRITICAL:** The helper returns a `send_nonce` that you **must** echo back in the subsequent `send` request. The nonce is bound to the exact `(to, text, service)` triple and expires after `send_nonce_ttl_seconds` (default 60s). This enforces the preview-then-confirm gate at the helper level.
+**CRITICAL:** The helper returns a `send_nonce` that you **must** echo back in the subsequent `send` request. For text-only sends the nonce is bound to the exact `(to, text, service)` triple. When `image` is present it is also bound to that file's path, filename, mime, size, and sha256. It expires after `send_nonce_ttl_seconds` (default 60s). This enforces the preview-then-confirm gate at the helper level.
 
-`send_preview` does **not** read `chat.db` and does **not** send anything. It only validates the recipient and body, resolves the contact name, and checks the blocklist.
+`send_preview` does **not** read `chat.db` and does **not** send anything. It validates the recipient, the body, and any image, resolves the contact name, and checks the blocklist.
+
+#### Optional image attachment
+
+Add `image.path` (absolute local path) to send one image to the same individual recipient. `text` becomes an optional caption and may be omitted. Supported files: png, jpeg (`.jpg` or `.jpeg`), gif, webp, heic, heif. The extension must match the file's magic bytes. Maximum size is 25 MiB. Symlinks, relative paths, directories, empty files, and non-images are rejected. Group chat IDs stay rejected.
+
+```json
+{"id": "abc123", "action": "send_preview", "params": {"to": "+14155551234", "text": "See you at 3.", "service": "iMessage", "image": {"path": "/Users/matthew/Pictures/photo.jpg"}}}
+```
+
+The preview adds `preview.image` with `path`, `filename`, `mime`, `size`, and `sha256`. Show those to the user along with the caption. The following `send` must echo that object unchanged.
 
 ---
 
@@ -272,7 +282,9 @@ Useful for disambiguating before `chat_history` or `send`.
 {"id": "abc123", "action": "send", "params": {"to": "+14155551234", "text": "Confirmed for 3pm.", "service": "iMessage", "send_nonce": "Zk9...short-opaque-string"}}
 ```
 
-The `send_nonce` is the one returned by the preceding `send_preview`. The `to`, `text`, and `service` **must** match the preview exactly.
+The `send_nonce` is the one returned by the preceding `send_preview`. The `to`, `text`, and `service` **must** match the preview exactly. Image sends must also echo `preview.image` (`path`, `filename`, `mime`, `size`, `sha256`).
+
+The native confirm dialog titles an image send **Image Send** and shows the filename, type, size, path, and caption. Cancel remains the keyboard default. Text-only sends still embed the body in AppleScript. Image sends copy the fingerprinted bytes to a private temp file after confirmation and hand that path to Messages; a caption is a second `send` in the same script.
 
 **Response on success:**
 ```json
@@ -300,7 +312,7 @@ Or:
 {"id": "abc123", "ok": false, "error": "send cancelled by user or timed out (60s dialog limit)"}
 ```
 
-The helper writes `text` to a temporary UTF-8 file, shells out to `/usr/bin/osascript` with a short AppleScript, and deletes the tempfile (even on failure).
+Text-only sends embed `text` in the AppleScript. Image sends stage a private copy of the file and delete it after `osascript` returns.
 
 **Send-gate validation (enforced helper-side):**
 
@@ -308,7 +320,8 @@ The helper writes `text` to a temporary UTF-8 file, shells out to `/usr/bin/osas
 - Nonces are single-use: consumed on first `send` attempt, deleted on any validation failure.
 - Replaying a used nonce, sending without a nonce, or changing the payload after preview all result in rejection before the confirmation dialog appears.
 - **After nonce validation succeeds, the helper displays a native macOS dialog** showing the resolved name, exact recipient address, service, and full message text in a scrollable view. Cancel is the keyboard default. The user must deliberately select **Send**; cancelling or waiting 60 seconds aborts the send.
-- Text must be 1–4000 chars with no C0 control bytes other than `\n`, `\r`, `\t`.
+- Text-only bodies must be 1–4000 chars with no C0 control bytes other than `\n`, `\r`, `\t`. An image caption may be empty; a non-empty caption uses the same limit.
+- One outbound image per send (png, jpeg, gif, webp, heic, heif, max 25 MiB). Echo the previewed image identity. Do not invent a path or hash.
 - Recipient must not be on `contacts/blocked_chats.txt`.
 - **Group chat IDs are NOT supported as send targets.** Only individual phone numbers or email addresses work for sending.
 
@@ -323,12 +336,13 @@ The helper writes `text` to a temporary UTF-8 file, shells out to `/usr/bin/osas
    - Resolved recipient name
    - Service (iMessage / SMS)
    - Full text and `text_length`
+   - Image filename, type, size, sha256, and path when `preview.image` is present
    - Whether `blocked: true` (if so, stop—don't prompt for approval)
 3. **Wait for explicit user approval in the chat.** Do not proceed without confirmation.
-4. **Issue `send` with the `send_nonce` from step 2.** The `to`, `text`, and `service` must match the preview exactly.
-5. **The helper will display a native macOS dialog** for final confirmation. The user must click **Send** in this system dialog.
-6. **If the chat approval takes >60s,** re-run `send_preview` to mint a fresh nonce.
-7. **Surface `sent.sent_at` and resolved name** as confirmation.
+4. **Issue `send` with the `send_nonce` from step 2.** The `to`, `text`, and `service` must match the preview exactly. For an image, echo `preview.image` unchanged and show the user the filename, type, size, and path before asking them to approve.
+5. **The helper will display a native macOS dialog** for final confirmation. Image sends title it **Image Send** and list the filename, type, size, and path. The user must click **Send** in this system dialog.
+6. **If the chat approval takes >60s,** or the image file changes, re-run `send_preview` to mint a fresh nonce.
+7. **Surface `sent.sent_at`, the resolved name, and `sent.image` when present** as confirmation.
 
 **Example shell workflow:**
 ```bash
@@ -427,7 +441,9 @@ The read policy is the reliable filter; redaction is a second line of defense.
 | `sqlite3.OperationalError: unable to open database file` in `log.txt` | FDA not granted, or grant stale | Re-add the wrapper in System Settings → Full Disk Access |
 | First send fails with Automation prompt | macOS needs Automation permission | Click **OK** on the prompt; future sends will work |
 | `send gate: missing nonce` | `send` called without prior `send_preview` | Always call `send_preview` first and pass the returned nonce |
-| `send payload differs from preview` | Body or recipient changed after preview | Re-run `send_preview` to mint a fresh nonce for the new payload |
+| `send payload differs from preview` | Body, recipient, service, or image identity changed after preview | Re-run `send_preview` to mint a fresh nonce for the new payload |
+| `image file does not match the previewed attachment` | The file changed after preview | Re-run `send_preview` |
+| `confirmation helper does not support image sends` | Confirm helper binary is older than protocol 1.3 | Rebuild `grokbot-imessage-confirm` (see `docs/PROTOCOL.md`) |
 | Messages decode as empty | `attributedBody` parser failed | Check `control/log.txt` for a byte-count-only parser diagnostic |
 
 Check `<bridge>/control/log.txt` first when debugging. It contains helper stderr and logging.
@@ -436,7 +452,7 @@ Check `<bridge>/control/log.txt` first when debugging. It contains helper stderr
 
 ## What the Helper Won't Do
 
-- **No attachments, images, stickers, audio, Tapback reactions.** Text fields only.
+- **No inbound attachment reading, stickers, audio, or Tapback reactions.** One outbound image to an individual recipient is supported. Group sends are not.
 - **No message editing or deletion.** Once sent, a message is immutable from the helper's perspective.
 - **No message effects** (balloons, confetti, invisible ink).
 - **No group-chat sending.** Group chat IDs can be read (`review`, `chat_history`), but **cannot be used as send targets**. Sending requires individual phone numbers or email addresses.

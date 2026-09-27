@@ -101,8 +101,8 @@ Concretely, this grants the helper the ability to:
   iMessage-enabled addresses.
 - Query Messages.app AppleScript state (services, buddies, chats).
 
-It does NOT grant access to attachments, effects, edit/delete, or
-group-chat creation — those aren't in the AppleScript surface.
+The same `send` command can hand Messages a local image file. It does not
+grant sticker, audio, effect, edit/delete, or group-chat creation support.
 
 ## Trust boundaries
 
@@ -148,7 +148,8 @@ Sending is confirmation-gated via a two-layer preview/confirm protocol:
 1. The AI asks the helper for a `send_preview` — the helper does
    NOT send; it echoes back the normalized payload and mints a
    one-shot **send nonce** bound to exactly that `(to, text, service)`
-   triple.
+   triple. An image send is also bound to the file path, filename, MIME
+   type, size, and sha256.
 2. Grok Bot shows the preview to you in chat; you approve.
 3. The AI asks the helper to `send`, passing the nonce from step 1.
    The helper recomputes the payload hash, compares it to the nonce's
@@ -161,6 +162,7 @@ Sending is confirmation-gated via a two-layer preview/confirm protocol:
    - Recipient (resolved contact name if available)
    - Service (iMessage or SMS)
    - Full message text in a scrollable, read-only view
+   - For an image: filename, MIME type, size, path, and caption
 5. Cancel is the keyboard default. You must deliberately select **Send** to proceed. Clicking **Cancel** or waiting
    60 seconds aborts the send.
 
@@ -176,20 +178,32 @@ Sending is confirmation-gated via a two-layer preview/confirm protocol:
    in Layer 2 is embedded in the AppleScript, so transmitted bytes match the
    dialog exactly.
 
+   Image bytes cannot be embedded in AppleScript. After confirmation the helper
+   re-reads the file descriptor it fingerprinted, copies those bytes into a
+   mode-`0700` temporary directory, hashes the copy, and passes only that staged
+   path to Messages. The staged file is removed when `osascript` returns. A
+   same-UID process that can replace the staged file in the interval after the
+   hash check and before Messages reads it could still swap bytes; that is the
+   same local-user attacker who can already write bridge requests. The dialog
+   remains the approval boundary, and a change to the original file before
+   confirmation is rejected.
+
 This three-layer gate is enforced **helper-side**. A process that writes
 directly to the bridge folder and issues a `send` with no nonce, a forged
 nonce, a replayed (already-consumed) nonce, an expired nonce (TTL is 60
 seconds), or a nonce whose bound payload differs from the `send` request's
-`(to, text, service)` is rejected before the dialog appears. Nonces are stored as per-file records under `<bridge-folder>/nonces/`; the nonce directory is mode `700` and nonce files are mode `600`. Nonces are single-use (deleted on consume) and are also deleted on validation failure so the same nonce cannot be retried with a corrected payload.
+`(to, text, service)` — plus image path, filename, MIME type, size, and
+sha256 when an image is attached — is rejected before the dialog appears. Nonces are stored as per-file records under `<bridge-folder>/nonces/`; the nonce directory is mode `700` and nonce files are mode `600`. Nonces are single-use (deleted on consume) and are also deleted on validation failure so the same nonce cannot be retried with a corrected payload.
 
 An attacker who can write to and read from the bridge can mint its own preview
 nonce; the nonce is not an authorization boundary against that attacker. It
 still prevents a blind one-request send, replay, or swapping the payload after a
 preview. To complete any attacker-created send, the victim must deliberately
 click **Send** in the native dialog showing the exact recipient, service, and
-complete message body. The approved body is then passed integrity-preserved
-to AppleScript (same Python `text` variable, no mutable pathname), so transmitted
-bytes match the dialog exactly. Unexpected dialogs should always be cancelled.
+complete message body (and, for an image, the filename, type, size, and path).
+The approved text body is then passed integrity-preserved to AppleScript (same
+Python `text` variable, no mutable pathname). Image bytes are the fingerprinted
+copy described above. Unexpected dialogs should always be cancelled.
 
 The v0.3.x AI-side check still runs as well; the helper-side nonce gate
 and native dialog are defense in depth, not a replacement.

@@ -22,8 +22,10 @@ hardening the wrapper provides.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
@@ -113,8 +115,8 @@ _PRODUCT_ENV_VARS = (
 )
 WRAPPER_MODE = "product" if any(v in os.environ for v in _PRODUCT_ENV_VARS) else "baked"
 
-HELPER_VERSION = "1.4.8"
-PROTOCOL_VERSION = "1.2"
+HELPER_VERSION = "1.5.0"
+PROTOCOL_VERSION = "1.3"
 
 # Bridge role. The DIY install and every host bridge run as "host". A
 # management bridge (product mode, IMESSAGE_BRIDGE_ROLE=manager) is the only
@@ -236,6 +238,33 @@ LOG_BACKUP_COUNT = 3
 # well above any plausible conversational message.
 MAX_SEND_LEN = 4000
 _SERVICE_ENUM = ("iMessage", "SMS")
+
+# Outbound image attachments (protocol 1.3). Text-only sends omit `image`
+# and never consult these limits. 25 MiB is below Messages' practical
+# attachment ceiling and keeps preview hashing bounded.
+MAX_OUTBOUND_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_IMAGE_PATH_LEN = 1024
+_IMAGE_CONFIRM_MARKER = b"IMESSAGE_CONFIRM_IMAGE_V1"
+_IMAGE_IDENTITY_KEYS = ("path", "filename", "mime", "size", "sha256")
+_IMAGE_EXTENSION_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+}
+_MIME_TO_EXTENSION = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+}
+_HEIC_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs"}
+_HEIF_BRANDS = {b"heif", b"mif1", b"msf1"}
 
 # osascript timeout — the send itself is sub-second; anything much longer
 # means Messages.app is hung or prompting for Automation permission.
@@ -1191,24 +1220,57 @@ def _run_osascript(script: str, timeout: float = OSASCRIPT_TIMEOUT_S
     return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
 
 
+def _confirmation_helper_supports_images() -> bool:
+    """True when the built confirm helper advertises outbound image support.
+
+    Image sends fail closed against an older confirm binary, which would
+    otherwise show only the caption and still return success.
+    """
+    try:
+        with open(CONFIRM_HELPER_PATH, "rb") as handle:
+            blob = handle.read()
+    except OSError as exc:
+        raise RuntimeError(f"confirmation helper could not be read: {exc}") from exc
+    return _IMAGE_CONFIRM_MARKER in blob
+
+
 def _run_send_confirmation(
-    *, to: str, resolved_name: str, service: str, text: str
+    *,
+    to: str,
+    resolved_name: str,
+    service: str,
+    text: str,
+    image: dict | None = None,
 ) -> bool:
     """Show the full outbound payload in the native confirmation helper.
 
     Return True only for the helper's explicit Send exit status. Cancel and
     timeout return False; malformed input or helper failures raise.
+
+    Text-only calls omit ``image`` and keep the historical JSON payload.
+    Image calls add filename, type, size, and path, and require a confirm
+    helper that was built with image support.
     """
-    payload = json.dumps(
-        {
-            "client_name": HOST_DISPLAY_NAME,
-            "to": to,
-            "resolved_name": resolved_name,
-            "service": service,
-            "text": text,
-        },
-        ensure_ascii=False,
-    )
+    payload_dict: dict[str, Any] = {
+        "client_name": HOST_DISPLAY_NAME,
+        "to": to,
+        "resolved_name": resolved_name,
+        "service": service,
+        "text": text,
+    }
+    if image is not None:
+        if not _confirmation_helper_supports_images():
+            raise RuntimeError(
+                "confirmation helper does not support image sends; "
+                "rebuild grokbot-imessage-confirm from bin/confirm_imessage_send.m"
+            )
+        payload_dict["image"] = {
+            "filename": image["filename"],
+            "mime": image["mime"],
+            "size": image["size"],
+            "path": image["path"],
+        }
+    payload = json.dumps(payload_dict, ensure_ascii=False)
     try:
         result = subprocess.run(
             [str(CONFIRM_HELPER_PATH)],
@@ -1816,6 +1878,293 @@ action_status.needs_contacts = False  # type: ignore[attr-defined]
 # ---------------------------------------------------------------------------
 # Send actions (AppleScript-driven)
 # ---------------------------------------------------------------------------
+def _detect_image_mime(header: bytes) -> str | None:
+    """Return a supported image MIME type from magic bytes, or None."""
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "image/webp"
+    if len(header) >= 12 and header[4:8] == b"ftyp":
+        brand = header[8:12]
+        if brand in _HEIC_BRANDS:
+            return "image/heic"
+        if brand in _HEIF_BRANDS:
+            return "image/heif"
+    return None
+
+
+def _mime_for_filename(filename: str) -> str:
+    lowered = filename.lower()
+    for extension, mime in sorted(_IMAGE_EXTENSION_MIME.items(), key=lambda item: len(item[0]), reverse=True):
+        if lowered.endswith(extension):
+            return mime
+    raise ValueError(
+        "image file must use a png, jpg, jpeg, gif, webp, heic, or heif extension"
+    )
+
+
+def _open_image_fd(path: str) -> int:
+    """Open an absolute image path without following any symlink component."""
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError("image path must be an absolute path")
+    if len(path) > MAX_IMAGE_PATH_LEN:
+        raise ValueError(
+            f"image path is too long ({len(path)} chars; max {MAX_IMAGE_PATH_LEN})"
+        )
+    if any(ord(ch) < 0x20 for ch in path):
+        raise ValueError("image path contains disallowed control characters")
+    parts = path.split("/")
+    if parts[0] != "" or any(part in ("", ".", "..") for part in parts[1:]):
+        raise ValueError(
+            "image path must be absolute and must not contain empty, '.', or '..' components"
+        )
+    fd = os.open("/", _DIR_OPEN_FLAGS)
+    try:
+        for index, component in enumerate(parts[1:]):
+            last = index == len(parts) - 2
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            flags |= os.O_NONBLOCK if last else os.O_DIRECTORY
+            try:
+                next_fd = os.open(component, flags, dir_fd=fd)
+            except OSError as exc:
+                # Linux reports O_NOFOLLOW|O_DIRECTORY on a symlink as ENOTDIR.
+                # macOS reports ELOOP. A non-directory component is ENOTDIR too.
+                if exc.errno == errno.ELOOP or (not last and exc.errno == errno.ENOTDIR):
+                    raise ValueError(
+                        "image path must not contain symlinks or non-directory components"
+                    ) from exc
+                if exc.errno == errno.ENOENT:
+                    raise ValueError("image file not found") from exc
+                if exc.errno in (errno.EACCES, errno.EPERM):
+                    raise ValueError("image file is not readable") from exc
+                raise ValueError(f"image file is not readable: {exc.strerror}") from exc
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _read_image_fd(fd: int, expected_size: int) -> tuple[str, bytes]:
+    """Hash ``fd`` from the start and return ``(sha256, header)``."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    hasher = hashlib.sha256()
+    header = b""
+    total = 0
+    while total < expected_size:
+        chunk = os.read(fd, min(1024 * 1024, expected_size - total))
+        if not chunk:
+            break
+        if total < 32:
+            header += chunk[: 32 - len(header)]
+        hasher.update(chunk)
+        total += len(chunk)
+    if total != expected_size:
+        raise ValueError("image file changed while reading")
+    extra = os.read(fd, 1)
+    if extra:
+        raise ValueError("image file changed while reading")
+    return hasher.hexdigest(), header
+
+
+def inspect_outbound_image(path: str) -> tuple[dict, int]:
+    """Fingerprint a local image and return ``(identity, fd)``.
+
+    On success the fd is positioned at byte 0 and the caller must close it.
+    On failure the fd is closed and a ValueError is raised.
+    """
+    fd = _open_image_fd(path)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("image path is not a regular file")
+        if metadata.st_size <= 0:
+            raise ValueError("image file is empty")
+        if metadata.st_size > MAX_OUTBOUND_IMAGE_BYTES:
+            raise ValueError(
+                f"image file is too large ({metadata.st_size} bytes; "
+                f"max {MAX_OUTBOUND_IMAGE_BYTES})"
+            )
+        filename = path.rsplit("/", 1)[-1]
+        if not filename or len(filename) > 255:
+            raise ValueError("image filename is invalid")
+        expected_mime = _mime_for_filename(filename)
+        digest, header = _read_image_fd(fd, metadata.st_size)
+        detected = _detect_image_mime(header)
+        if detected is None:
+            raise ValueError(
+                "image file is not a supported image type "
+                "(png, jpeg, gif, webp, heic, or heif)"
+            )
+        if detected != expected_mime:
+            raise ValueError(
+                f"image content ({detected}) does not match the file extension "
+                f"({expected_mime})"
+            )
+        os.lseek(fd, 0, os.SEEK_SET)
+        identity = {
+            "path": path,
+            "filename": filename,
+            "mime": detected,
+            "size": metadata.st_size,
+            "sha256": digest,
+        }
+        return identity, fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _validate_supplied_image_fields(supplied: dict, *, require_complete: bool) -> None:
+    if not isinstance(supplied, dict):
+        raise ValueError("image must be an object")
+    path = supplied.get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError("image path must be a non-empty string")
+    for key in ("filename", "mime", "size", "sha256"):
+        if key not in supplied:
+            if require_complete:
+                raise ValueError(
+                    "image identity is incomplete; echo path, filename, mime, "
+                    "size, and sha256 from send_preview"
+                )
+            continue
+        value = supplied[key]
+        if key == "size":
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError("image size must be a positive integer")
+        elif key == "sha256":
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError("image sha256 must be 64 lowercase hex characters")
+        elif key == "mime":
+            if value not in _MIME_TO_EXTENSION:
+                raise ValueError(f"image mime type is not supported: {value!r}")
+        elif not isinstance(value, str) or not value or "/" in value or any(ord(ch) < 0x20 for ch in value):
+            raise ValueError("image filename is invalid")
+
+
+def _load_outbound_image(raw: Any, *, require_complete: bool) -> tuple[dict | None, int | None]:
+    """Validate an optional request ``image`` object.
+
+    Returns ``(None, None)`` when no image was requested. Otherwise returns
+    the fingerprinted identity and an open fd positioned at byte 0.
+    """
+    if raw is None:
+        return None, None
+    _validate_supplied_image_fields(raw, require_complete=require_complete)
+    identity, fd = inspect_outbound_image(raw["path"])
+    try:
+        for key in _IMAGE_IDENTITY_KEYS:
+            if key not in raw:
+                continue
+            if raw[key] != identity[key]:
+                raise ValueError("image file does not match the previewed attachment")
+    except Exception:
+        os.close(fd)
+        raise
+    return identity, fd
+
+
+def _outbound_text(params: dict, *, image_present: bool) -> str:
+    """Return the caption/body. Empty is allowed only for an image send."""
+    if "text" not in params or params.get("text") is None:
+        if image_present:
+            return ""
+        raise ValueError("text must be a string")
+    text = params.get("text")
+    if text == "":
+        if image_present:
+            return ""
+        raise ValueError("text cannot be empty")
+    return validate_send_text(text)
+
+
+def _stage_outbound_image(source_fd: int, identity: dict) -> tuple[str, str]:
+    """Copy the already-fingerprinted bytes into a private file.
+
+    Returns ``(directory, file_path)``. The copy is hashed again and must
+    match ``identity`` before it can be handed to Messages.
+    """
+    extension = _MIME_TO_EXTENSION[identity["mime"]]
+    stage_dir = tempfile.mkdtemp(prefix="grokbot-imessage-image-")
+    os.chmod(stage_dir, 0o700)
+    stage_path = os.path.join(stage_dir, "attachment" + extension)
+    out_fd = os.open(
+        stage_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        hasher = hashlib.sha256()
+        total = 0
+        expected = identity["size"]
+        while total < expected:
+            chunk = os.read(source_fd, min(1024 * 1024, expected - total))
+            if not chunk:
+                break
+            hasher.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(out_fd, view)
+                view = view[written:]
+            total += len(chunk)
+        if total != expected or hasher.hexdigest() != identity["sha256"]:
+            raise ValueError("image file changed during send")
+    except Exception:
+        os.close(out_fd)
+        _discard_staged_image(stage_dir, stage_path)
+        raise
+    os.close(out_fd)
+    return stage_dir, stage_path
+
+
+def _discard_staged_image(stage_dir: str | None, stage_path: str | None) -> None:
+    if stage_path:
+        try:
+            os.unlink(stage_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log(f"could not remove staged image: {exc}")
+    if stage_dir:
+        try:
+            os.rmdir(stage_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log(f"could not remove staged image directory: {exc}")
+
+
+def _image_send_script(*, to: str, text: str, service: str, image_path: str) -> str:
+    """AppleScript that sends one image and an optional caption.
+
+    Messages' ``send`` command accepts either text or a file. A caption is
+    a second ``send`` in the same script, after the image. The path is the
+    helper-staged copy, not the caller's original path.
+    """
+    if service == "iMessage":
+        svc_clause = "1st service whose service type = iMessage"
+    else:
+        svc_clause = "1st service whose service type = SMS"
+    lines = [
+        'tell application "Messages"',
+        f"    set svc to {svc_clause}",
+        f'    set targetBuddy to buddy "{_escape_as_string(to)}" of svc',
+        f'    send (POSIX file "{_escape_as_string(image_path)}") to targetBuddy',
+    ]
+    if text:
+        lines.append(f'    set msgBody to "{_escape_as_string(text)}"')
+        lines.append("    send msgBody to targetBuddy")
+    lines.append("end tell")
+    return "\n".join(lines) + "\n"
+
+
 def _resolve_contact_name(to: str, contacts: dict[str, str]) -> str:
     """Best-effort name lookup from phone or email targets.
 
@@ -1843,25 +2192,35 @@ def action_send_preview(params, conn, contacts, privacy_policy):
         raise ValueError("send operations are disabled by policy")
 
     to = validate_send_recipient(params.get("to"))
-    text = validate_send_text(params.get("text"))
     service = validate_service(params.get("service"))
+    raw_image = params.get("image") if "image" in params else None
+    text = _outbound_text(params, image_present=raw_image is not None)
+    identity, image_fd = _load_outbound_image(raw_image, require_complete=False)
+    if image_fd is not None:
+        os.close(image_fd)
 
-    send_nonce = mint_send_nonce(to, text, service)
+    if identity is None:
+        send_nonce = mint_send_nonce(to, text, service)
+    else:
+        send_nonce = mint_send_nonce(to, text, service, identity)
 
     resolved_name = (
         _resolve_contact_name(to, contacts)
         if is_read_allowed(to, to, privacy_policy)
         else ""
     )
+    preview = {
+        "to": to,
+        "resolved_name": resolved_name,
+        "service": service,
+        "text": text,
+        "text_length": len(text),
+        "blocked": is_blocked(to, to, privacy_policy),
+    }
+    if identity is not None:
+        preview["image"] = identity
     return {
-        "preview": {
-            "to": to,
-            "resolved_name": resolved_name,
-            "service": service,
-            "text": text,
-            "text_length": len(text),
-            "blocked": is_blocked(to, to, privacy_policy),
-        },
+        "preview": preview,
         "send_nonce": send_nonce,
         "send_nonce_ttl_seconds": SEND_NONCE_TTL,
     }
@@ -1886,72 +2245,108 @@ def action_send(params, conn, contacts, privacy_policy):
     The `service type` slot is an AppleScript enum, not a string. We pick
     the clause statically from the validated service name so no untrusted
     input is ever interpolated into that slot.
+
+    Image sends keep that text path for the caption and additionally copy
+    the fingerprinted file into a private temp path after confirmation.
+    Messages receives that staged path, not the caller's original path.
     """
     if not is_send_policy_enabled():
         raise ValueError("send operations are disabled by policy")
 
     to = validate_send_recipient(params.get("to"))
-    text = validate_send_text(params.get("text"))
     service = validate_service(params.get("service"))
+    raw_image = params.get("image") if "image" in params else None
+    text = _outbound_text(params, image_present=raw_image is not None)
 
     if is_blocked(to, to, privacy_policy):
         raise ValueError(
             f"refusing to send: {to!r} is in contacts/blocked_chats.txt"
         )
 
-    # v0.4.0+: helper-side send gate. `send_preview` must have been called
-    # first for this exact (to, text, service) triple, and the resulting
-    # single-use nonce must be echoed back within the TTL window. This
-    # enforces preview-then-confirm even if the bridge has been bypassed
-    # by some process writing directly into control/requests/.
-    consume_send_nonce(params.get("send_nonce"), to, text, service)
+    identity, image_fd = _load_outbound_image(raw_image, require_complete=True)
+    stage_dir = None
+    stage_path = None
+    try:
+        # v0.4.0+: helper-side send gate. `send_preview` must have been called
+        # first for this exact payload, and the resulting single-use nonce
+        # must be echoed back within the TTL window. Text-only nonces stay
+        # bound to (to, text, service). Image nonces also bind path, filename,
+        # mime, size, and sha256.
+        if identity is None:
+            consume_send_nonce(params.get("send_nonce"), to, text, service)
+        else:
+            consume_send_nonce(params.get("send_nonce"), to, text, service, identity)
 
-    # Require explicit human approval before AppleScript sends. The native
-    # helper shows both the resolved and raw recipient plus the complete body
-    # in a scrollable view. Cancel is the keyboard default and all unexpected
-    # outcomes fail closed.
-    resolved_name = _resolve_contact_name(to, contacts)
-    if not _run_send_confirmation(
-        to=to,
-        resolved_name=resolved_name,
-        service=service,
-        text=text,
-    ):
-        raise RuntimeError(
-            "send cancelled by user or timed out (60s dialog limit)"
-        )
-
-    if service == "iMessage":
-        svc_clause = "1st service whose service type = iMessage"
-    else:  # SMS — already validated against _SERVICE_ENUM
-        svc_clause = "1st service whose service type = SMS"
-
-    # Pass the body directly in the AppleScript with proper escaping.
-    # This eliminates the tempfile race where a malicious same-UID process
-    # could replace the file between write and read.
-    script = (
-        f'set msgBody to "{_escape_as_string(text)}"\n'
-        f'tell application "Messages"\n'
-        f'    set svc to {svc_clause}\n'
-        f'    send msgBody to buddy "{_escape_as_string(to)}" of svc\n'
-        f'end tell\n'
-    )
-    rc, stdout, stderr = _run_osascript(script)
-    if rc != 0:
-        raise RuntimeError(
-            f"osascript send failed (rc={rc}): "
-            f"{stderr or stdout or 'no output'}"
-        )
-
-    return {
-        "sent": {
+        # Require explicit human approval before AppleScript sends. The native
+        # helper shows both the resolved and raw recipient plus the complete body
+        # in a scrollable view. Image sends also show filename, type, size, and
+        # path. Cancel is the keyboard default and all unexpected outcomes fail
+        # closed.
+        resolved_name = _resolve_contact_name(to, contacts)
+        confirm_kwargs = {
             "to": to,
-            "resolved_name": _resolve_contact_name(to, contacts),
+            "resolved_name": resolved_name,
             "service": service,
-            "text_length": len(text),
-            "sent_at": datetime.now().isoformat(timespec="seconds"),
+            "text": text,
         }
+        if identity is not None:
+            confirm_kwargs["image"] = identity
+        if not _run_send_confirmation(**confirm_kwargs):
+            raise RuntimeError(
+                "send cancelled by user or timed out (60s dialog limit)"
+            )
+
+        if identity is None:
+            if service == "iMessage":
+                svc_clause = "1st service whose service type = iMessage"
+            else:  # SMS — already validated against _SERVICE_ENUM
+                svc_clause = "1st service whose service type = SMS"
+
+            # Pass the body directly in the AppleScript with proper escaping.
+            # This eliminates the tempfile race where a malicious same-UID process
+            # could replace the file between write and read.
+            script = (
+                f'set msgBody to "{_escape_as_string(text)}"\n'
+                f'tell application "Messages"\n'
+                f'    set svc to {svc_clause}\n'
+                f'    send msgBody to buddy "{_escape_as_string(to)}" of svc\n'
+                f'end tell\n'
+            )
+        else:
+            # Re-copy from the fd opened before confirmation so a path swap
+            # during the dialog cannot change the bytes. The staged path is
+            # what Messages reads; it is removed after osascript returns.
+            if image_fd is None:
+                raise RuntimeError("image file was closed before send")
+            stage_dir, stage_path = _stage_outbound_image(image_fd, identity)
+            script = _image_send_script(
+                to=to,
+                text=text,
+                service=service,
+                image_path=stage_path,
+            )
+
+        rc, stdout, stderr = _run_osascript(script)
+        if rc != 0:
+            raise RuntimeError(
+                f"osascript send failed (rc={rc}): "
+                f"{stderr or stdout or 'no output'}"
+            )
+    finally:
+        if image_fd is not None:
+            os.close(image_fd)
+        _discard_staged_image(stage_dir, stage_path)
+
+    sent = {
+        "to": to,
+        "resolved_name": _resolve_contact_name(to, contacts),
+        "service": service,
+        "text_length": len(text),
+        "sent_at": datetime.now().isoformat(timespec="seconds"),
     }
+    if identity is not None:
+        sent["image"] = identity
+    return {"sent": sent}
 
 
 action_send.needs_db = False  # type: ignore[attr-defined]

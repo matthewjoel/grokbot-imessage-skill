@@ -6,6 +6,22 @@ version reported by the `status` action.
 
 ## Unreleased
 
+## 1.5.0 - 2026-09-27
+
+- Protocol 1.3: send one outbound image to an individual recipient through the
+  existing `send_preview` / `send` gate. The nonce binds path, filename, MIME
+  type, size, and sha256 in addition to recipient, caption, and service.
+  Text-only sends are unchanged, including the embedded-AppleScript body.
+- The native confirm dialog shows an image send's filename, type, size, path,
+  and caption. Image sends fail closed unless `grokbot-imessage-confirm` was
+  rebuilt with `IMESSAGE_CONFIRM_IMAGE_V1`.
+- Supported files are local png, jpeg, gif, webp, heic, and heif up to 25 MiB.
+  Missing, unreadable, non-image, and symlink paths are rejected. Group chat
+  IDs and blocked chats stay blocked.
+- This fork only. Do not contribute the shared-core fingerprint change upstream.
+  Sibling parity comparison is disabled here because the security core
+  intentionally diverges.
+
 ## 1.4.8 - 2026-09-13
 
 - Fixed `configure_allowlist.py` to work with hardened install layout where the
