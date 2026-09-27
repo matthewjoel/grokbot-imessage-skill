@@ -248,7 +248,7 @@ boundary.
 Sending is gated at the **helper level** with two layers of protection:
 
 **1. Nonce validation (v0.4.0+):**
-   - Grok Bot issues a `send_preview` → the helper returns the normalized payload and a **single-use send nonce** bound to that exact `(to, text, service)` triple.
+   - Grok Bot issues a `send_preview` → the helper returns the normalized payload and a **single-use send nonce** bound to that exact `(to, text, service)` triple, plus image path, filename, MIME type, size, and sha256 when an image is attached.
    - Grok Bot shows you the preview in chat; you approve.
    - Grok Bot issues a `send` with the nonce → the helper verifies the nonce matches the payload.
 
@@ -262,7 +262,7 @@ Sending is gated at the **helper level** with two layers of protection:
 
 <!-- Screenshot: docs/images/send-confirm-dialog.png (illustrative; actual dialog appearance may vary by macOS version) -->
 
-The native macOS confirmation dialog displays after valid send nonce validation. **Cancel** is the keyboard default (Return key); **Send** requires a deliberate click. The dialog shows the recipient (resolved contact name if available, otherwise the raw identifier), service (iMessage or SMS), and the complete message body in a scrollable, read-only text view.
+The native macOS confirmation dialog displays after valid send nonce validation. **Cancel** is the keyboard default (Return key); **Send** requires a deliberate click. The dialog shows the recipient (resolved contact name if available, otherwise the raw identifier), service (iMessage or SMS), and the complete message body in a scrollable, read-only text view. An image send also lists the filename, type, size, and path.
 
 Nonces expire after 60 seconds, are single-use, and are deleted on validation
 failure. A process that can read and write the bridge can mint its own nonce, so
@@ -367,7 +367,7 @@ running.
 
 ## Limitations
 
-- **Text only.** No attachments, images, stickers, audio, Tapback reactions, message effects, or message editing/deletion.
+- **One outbound image, or text.** `send_preview` / `send` can attach one local png, jpeg, gif, webp, heic, or heif (max 25 MiB) to an individual recipient. No inbound attachment reading, stickers, audio, Tapback reactions, message effects, or message editing/deletion.
 - **No group-chat sending.** Can read from group chats (they appear in `review` and `chat_history`), but cannot send *to* group chat IDs. Use individual phone numbers or emails for sending.
 - **No group-chat creation.** Cannot create new group chats.
 - **Local `chat.db` only.** If a thread hasn't synced to this Mac, it won't appear.

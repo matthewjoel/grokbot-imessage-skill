@@ -31,9 +31,12 @@ jobs:
       - name: Verify shared core against local manifest
         run: python3 tools/check_shared_core.py
 
-  # Cross-repo comparison: checks all three siblings for drift (manual and scheduled only)
+  # This fork's outbound image send changes the shared security core on
+  # purpose. Sibling comparison would fail against upstream forever, and
+  # those changes must not be contributed back. Self-check above still
+  # enforces this repo's own manifest.
   compare:
-    if: github.event_name != 'push'
+    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Check out Grok Bot repository

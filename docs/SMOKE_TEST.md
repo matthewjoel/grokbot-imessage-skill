@@ -171,6 +171,27 @@ confirm `protocol_version` begins with `1` and the installation checks are true.
 
 ---
 
+## Test 6b: Image send (optional)
+
+Skip this until `grokbot-imessage-confirm` has been rebuilt from the protocol 1.3
+source. Use a real individual recipient and a small local JPEG or PNG.
+
+**Ask Grok Bot to send the image:**
+
+"Send `/Users/matthew/Pictures/photo.jpg` to +15551234567 with the caption `test image`."
+
+**Expected:**
+1. `send_preview` returns `preview.image` with filename, MIME type, size, and sha256.
+2. Grok Bot shows those fields and waits for your approval.
+3. `send` echoes that image object plus the preview nonce.
+4. The native dialog title says **Image Send** and lists the filename, type, size, path, and caption. Cancel is still the default.
+5. After you click **Send**, Messages shows the image and then the caption.
+6. A group chat id, a missing file, or a non-image is rejected and nothing is sent.
+
+Text-only Test 6 must still work after this.
+
+---
+
 ## Test 7: Check Logs
 
 **Read the helper logs:**
@@ -202,7 +223,7 @@ You can now use Grok Bot to:
 - Search message history
 - Pull conversation threads
 - Compute response-time stats
-- Send plain-text iMessages with preview-and-confirm safety
+- Send plain-text iMessages, or one image attachment, with preview-and-confirm safety
 
 ---
 

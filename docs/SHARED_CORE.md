@@ -1,5 +1,11 @@
 # Shared Core Maintenance
 
+This fork (`matthewjoel/grokbot-imessage-skill`) intentionally diverges from
+the upstream shared core. Protocol 1.3 outbound image send changes
+`helper.py`, `send_gate.py`, and `confirm_imessage_send.m`. Do not copy those
+fingerprints upstream and do not open an upstream PR to "restore" parity.
+The scheduled sibling comparison workflow is disabled in this fork.
+
 The Claude Cowork, Grok Bot, and ChatGPT/Codex repositories deploy independent
 macOS helpers. They intentionally do not share an installed wrapper, LaunchAgent,
 bridge directory, read policy, nonce store, log, response queue, or Full Disk

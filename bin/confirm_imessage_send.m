@@ -27,6 +27,64 @@ static NSString *RequiredString(NSDictionary *payload, NSString *key) {
 }
 
 
+// Referenced below so the token survives compilation. The Python helper
+// refuses image sends unless this exact byte string is in the confirm binary.
+static const char kImageConfirmCapability[] = "IMESSAGE_CONFIRM_IMAGE_V1";
+
+
+static NSString *FormatByteCount(long long bytes) {
+    if (bytes < 1024) {
+        return [NSString stringWithFormat:@"%lld bytes", bytes];
+    }
+    if (bytes < (1024LL * 1024LL)) {
+        return [NSString stringWithFormat:@"%lld bytes (%.1f KiB)",
+                bytes, (double)bytes / 1024.0];
+    }
+    return [NSString stringWithFormat:@"%lld bytes (%.1f MiB)",
+            bytes, (double)bytes / (1024.0 * 1024.0)];
+}
+
+
+// Returns nil when no image is being sent. On an invalid image object,
+// writes an error and returns nil with *invalid set.
+static NSDictionary *ImagePayload(NSDictionary *payload, BOOL *invalid) {
+    id value = payload[@"image"];
+    if (value == nil || value == (id)kCFNull) {
+        return nil;
+    }
+    if (![value isKindOfClass:[NSDictionary class]]) {
+        fprintf(stderr, "confirmation helper: image must be an object\n");
+        *invalid = YES;
+        return nil;
+    }
+    NSDictionary *image = value;
+    NSString *filename = RequiredString(image, @"filename");
+    NSString *mime = RequiredString(image, @"mime");
+    NSString *path = RequiredString(image, @"path");
+    id rawSize = image[@"size"];
+    if (filename.length == 0 || mime.length == 0 || path.length == 0 ||
+        ![rawSize isKindOfClass:[NSNumber class]] ||
+        CFGetTypeID((__bridge CFTypeRef)rawSize) == CFBooleanGetTypeID()) {
+        fprintf(stderr, "confirmation helper: image filename, type, size, and path are required\n");
+        *invalid = YES;
+        return nil;
+    }
+    if ([(NSNumber *)rawSize longLongValue] <= 0) {
+        fprintf(stderr, "confirmation helper: image size is required\n");
+        *invalid = YES;
+        return nil;
+    }
+    // Volatile read keeps the capability token in the built binary even if
+    // the compiler can see that the literal is non-empty.
+    const volatile char *capability = kImageConfirmCapability;
+    if (capability[0] == '\0') {
+        *invalid = YES;
+        return nil;
+    }
+    return image;
+}
+
+
 int main(void) {
     @autoreleasepool {
         NSData *input = [[NSFileHandle fileHandleWithStandardInput] readDataToEndOfFile];
@@ -43,8 +101,14 @@ int main(void) {
         NSString *resolvedName = RequiredString(payload, @"resolved_name");
         NSString *service = RequiredString(payload, @"service");
         NSString *message = RequiredString(payload, @"text");
+        BOOL imageInvalid = NO;
+        NSDictionary *image = ImagePayload(payload, &imageInvalid);
+        if (imageInvalid) {
+            return 2;
+        }
         if (clientName.length == 0 || recipient.length == 0 ||
-            service.length == 0 || message.length == 0) {
+            service.length == 0 || message == nil ||
+            (image == nil && message.length == 0)) {
             fprintf(stderr, "confirmation helper: required field missing\n");
             return 2;
         }
@@ -66,16 +130,26 @@ int main(void) {
                 alert.icon = hostIcon;
             }
         }
-        alert.messageText = [NSString stringWithFormat:
-            @"Confirm %@ %@ Send", clientName, service];
+        alert.messageText = image == nil
+            ? [NSString stringWithFormat:@"Confirm %@ %@ Send", clientName, service]
+            : [NSString stringWithFormat:@"Confirm %@ %@ Image Send", clientName, service];
         NSString *displayRecipient = resolvedName.length > 0
             ? [NSString stringWithFormat:@"%@ (%@)", resolvedName, recipient]
             : recipient;
-        alert.informativeText = [NSString stringWithFormat:
-            @"Recipient: %@\nService: %@\nMessage length: %lu characters",
+        NSMutableString *info = [NSMutableString stringWithFormat:
+            @"Recipient: %@\nService: %@",
             displayRecipient,
-            service,
+            service];
+        if (image != nil) {
+            [info appendFormat:@"\nAttachment: %@\nType: %@\nSize: %@\nPath: %@",
+                image[@"filename"],
+                image[@"mime"],
+                FormatByteCount([image[@"size"] longLongValue]),
+                image[@"path"]];
+        }
+        [info appendFormat:@"\nMessage length: %lu characters",
             (unsigned long)message.length];
+        alert.informativeText = info;
 
         NSScrollView *scrollView = [[NSScrollView alloc]
             initWithFrame:NSMakeRect(0, 0, 560, 280)];
@@ -88,7 +162,7 @@ int main(void) {
         textView.selectable = YES;
         textView.richText = NO;
         textView.font = [NSFont systemFontOfSize:[NSFont systemFontSize]];
-        textView.string = message;
+        textView.string = (image != nil && message.length == 0) ? @"(no caption)" : message;
         textView.verticallyResizable = YES;
         textView.horizontallyResizable = NO;
         textView.autoresizingMask = NSViewWidthSizable;
