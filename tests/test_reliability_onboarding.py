@@ -317,13 +317,16 @@ class StatusContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="grokbot-status-test-") as td:
             chat_db = Path(td) / "chat.db"
             chat_db.write_bytes(b"fixture")
+            policy = Path(td) / "contacts"
+            policy.mkdir()
             with mock.patch.object(helper, "CHAT_DB_PATH", chat_db), mock.patch.object(
                 helper, "CONFIRM_HELPER_PATH", Path(td) / "grokbot-imessage-confirm"
-            ):
+            ), mock.patch.object(helper, "POLICY_ROOT", policy):
                 result = helper.action_status({}, None, {}, [])
 
         self.assertEqual(result["helper_version"], helper.HELPER_VERSION)
         self.assertEqual(result["protocol_version"], helper.PROTOCOL_VERSION)
+        self.assertEqual(result["native_confirm"], "required")
         self.assertEqual(result["product_id"], "grokbot-imessage")
         self.assertEqual(result["host_display_name"], "Grok Bot")
         self.assertEqual(result["launchd_label"], "com.jeffhuber.grokbot-imessage")

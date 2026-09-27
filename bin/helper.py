@@ -115,8 +115,8 @@ _PRODUCT_ENV_VARS = (
 )
 WRAPPER_MODE = "product" if any(v in os.environ for v in _PRODUCT_ENV_VARS) else "baked"
 
-HELPER_VERSION = "1.5.0"
-PROTOCOL_VERSION = "1.3"
+HELPER_VERSION = "1.6.0"
+PROTOCOL_VERSION = "1.4"
 
 # Bridge role. The DIY install and every host bridge run as "host". A
 # management bridge (product mode, IMESSAGE_BRIDGE_ROLE=manager) is the only
@@ -868,6 +868,62 @@ def load_privacy_policy() -> PrivacyPolicy:
 def load_blocklist() -> list[str]:
     """Backward-compatible loader retained for existing integrations/tests."""
     return list(_load_list(BLOCKLIST_PATH))
+
+
+def native_confirm_mode() -> str:
+    """Return ``required`` or ``skip`` for the native macOS send dialog.
+
+    Fork opt-in. A fresh install has no file and keeps the dialog. Write
+    ``skip`` as the first non-comment line of ``<policy-dir>/native_confirm.txt``
+    to send after a valid ``send_nonce`` without invoking
+    ``grokbot-imessage-confirm``. Anything else, including a missing,
+    unreadable, symlink, or group/world-writable file, stays ``required``.
+
+    The mode is a bridge file because the FDA wrapper replaces the process
+    environment. An env var would not reach this helper without rebuilding
+    that wrapper.
+    """
+    path = POLICY_ROOT / "native_confirm.txt"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return "required"
+    except OSError as exc:
+        log(f"native_confirm.txt unreadable ({exc}); native confirmation stays required")
+        return "required"
+    if not stat.S_ISREG(metadata.st_mode):
+        log("native_confirm.txt rejected: must be a regular file; native confirmation stays required")
+        return "required"
+    if metadata.st_uid != 0 and metadata.st_uid != os.getuid():
+        log(
+            "native_confirm.txt rejected: must be owned by root or the current user; "
+            "native confirmation stays required"
+        )
+        return "required"
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        log(
+            "native_confirm.txt rejected: must not be group/world-writable; "
+            "native confirmation stays required"
+        )
+        return "required"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        log(f"native_confirm.txt unreadable ({exc}); native confirmation stays required")
+        return "required"
+    mode = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        mode = stripped.lower()
+        break
+    if mode in ("", "required"):
+        return "required"
+    if mode == "skip":
+        return "skip"
+    log(f"native_confirm.txt has unknown mode {mode!r}; native confirmation stays required")
+    return "required"
 
 
 def is_send_policy_enabled() -> bool:
@@ -1842,6 +1898,7 @@ def action_status(params, conn, contacts, privacy_policy):
     return {
         "helper_version": HELPER_VERSION,
         "protocol_version": PROTOCOL_VERSION,
+        "native_confirm": native_confirm_mode(),
         "bridge_role": bridge_role(),
         "allowed_actions": sorted(allowed_actions()),
         "product_id": PRODUCT_ID,
@@ -2277,24 +2334,29 @@ def action_send(params, conn, contacts, privacy_policy):
         else:
             consume_send_nonce(params.get("send_nonce"), to, text, service, identity)
 
-        # Require explicit human approval before AppleScript sends. The native
-        # helper shows both the resolved and raw recipient plus the complete body
-        # in a scrollable view. Image sends also show filename, type, size, and
-        # path. Cancel is the keyboard default and all unexpected outcomes fail
-        # closed.
-        resolved_name = _resolve_contact_name(to, contacts)
-        confirm_kwargs = {
-            "to": to,
-            "resolved_name": resolved_name,
-            "service": service,
-            "text": text,
-        }
-        if identity is not None:
-            confirm_kwargs["image"] = identity
-        if not _run_send_confirmation(**confirm_kwargs):
-            raise RuntimeError(
-                "send cancelled by user or timed out (60s dialog limit)"
-            )
+        # Default: require a native dialog click before AppleScript sends.
+        # The dialog shows the resolved and raw recipient plus the complete
+        # body. Image sends also show filename, type, size, and path. Cancel
+        # is the keyboard default. ``contacts/native_confirm.txt`` set to
+        # ``skip`` omits that dialog after the nonce gate above; chat
+        # approval is then the human gate. Nonce, blocklist, group-chat, and
+        # image fingerprint checks still run first.
+        if native_confirm_mode() == "skip":
+            log("send: native confirmation skipped")
+        else:
+            resolved_name = _resolve_contact_name(to, contacts)
+            confirm_kwargs = {
+                "to": to,
+                "resolved_name": resolved_name,
+                "service": service,
+                "text": text,
+            }
+            if identity is not None:
+                confirm_kwargs["image"] = identity
+            if not _run_send_confirmation(**confirm_kwargs):
+                raise RuntimeError(
+                    "send cancelled by user or timed out (60s dialog limit)"
+                )
 
         if identity is None:
             if service == "iMessage":

@@ -7,7 +7,7 @@ description: >
   stats, or send a plain-text iMessage or one image attachment to an individual
   recipient. macOS only—uses an on-device launchd helper to query the Messages
   SQLite database and AppleScript (osascript) to send outbound messages.
-version: 1.5.0
+version: 1.6.0
 ---
 
 # iMessage on macOS — Grok Bot
@@ -36,7 +36,7 @@ Use when the user asks to:
 
 You run in an environment that can execute shell commands on the user's Mac. The iMessage helper is a launchd agent that watches a **bridge folder** for JSON request files. When you write a request, launchd fires the helper, which reads the Messages database, processes the request, and writes a JSON response back—where you can then read it.
 
-Sending goes through the **same** request/response bridge. You write a `send_preview` or `send` request, the helper calls `osascript` to drive Messages.app via AppleScript, and the result comes back as JSON. No GUI scripting or automated clicks; sends require a native confirmation dialog click—just a short-lived subprocess plus human approval.
+Sending goes through the **same** request/response bridge. You write a `send_preview` or `send` request, the helper calls `osascript` to drive Messages.app via AppleScript, and the result comes back as JSON. No GUI scripting or automated clicks. A fresh install still shows a native confirmation dialog after chat approval. If `status.native_confirm` is `skip`, that Mac dialog is off and chat approval plus a valid `send_nonce` is enough.
 
 ---
 
@@ -132,8 +132,10 @@ Full protocol documentation is in `docs/PROTOCOL.md`. Below is a quick reference
 {"id": "abc123", "action": "status", "params": {}}
 ```
 
-This action returns helper/protocol versions and local installation checks. It
-does not read `chat.db` or return message content.
+This action returns helper/protocol versions, `native_confirm` (`required` or
+`skip`), and local installation checks. It does not read `chat.db` or return
+message content. Read `native_confirm` before the first send so you know
+whether a Mac dialog will appear.
 
 ### `review` — Triage recent messages
 
@@ -284,7 +286,7 @@ The preview adds `preview.image` with `path`, `filename`, `mime`, `size`, and `s
 
 The `send_nonce` is the one returned by the preceding `send_preview`. The `to`, `text`, and `service` **must** match the preview exactly. Image sends must also echo `preview.image` (`path`, `filename`, `mime`, `size`, `sha256`).
 
-The native confirm dialog titles an image send **Image Send** and shows the filename, type, size, path, and caption. Cancel remains the keyboard default. Text-only sends still embed the body in AppleScript. Image sends copy the fingerprinted bytes to a private temp file after confirmation and hand that path to Messages; a caption is a second `send` in the same script.
+When `native_confirm` is `required` (the default), the native confirm dialog titles an image send **Image Send** and shows the filename, type, size, path, and caption. Cancel remains the keyboard default. When it is `skip`, the helper does not open that dialog. Text-only sends still embed the body in AppleScript. Image sends copy the fingerprinted bytes to a private temp file and hand that path to Messages; a caption is a second `send` in the same script.
 
 **Response on success:**
 ```json
@@ -318,8 +320,8 @@ Text-only sends embed `text` in the AppleScript. Image sends stage a private cop
 
 - The `send_nonce` must be present, fresh (within TTL), and match the payload.
 - Nonces are single-use: consumed on first `send` attempt, deleted on any validation failure.
-- Replaying a used nonce, sending without a nonce, or changing the payload after preview all result in rejection before the confirmation dialog appears.
-- **After nonce validation succeeds, the helper displays a native macOS dialog** showing the resolved name, exact recipient address, service, and full message text in a scrollable view. Cancel is the keyboard default. The user must deliberately select **Send**; cancelling or waiting 60 seconds aborts the send.
+- Replaying a used nonce, sending without a nonce, or changing the payload after preview all result in rejection before any confirmation dialog and before Messages is contacted.
+- **After nonce validation, native confirmation depends on `status.native_confirm`.** `required` (default) displays a native macOS dialog showing the resolved name, exact recipient address, service, and full message text. Image sends add filename, type, size, and path. Cancel is the keyboard default. The user must select **Send**; cancelling or waiting 60 seconds aborts the send. `skip` does not open that dialog. Chat approval is the human gate. Nonce TTL, the blocklist, group-chat rejection, and image fingerprint checks stay in force either way.
 - Text-only bodies must be 1–4000 chars with no C0 control bytes other than `\n`, `\r`, `\t`. An image caption may be empty; a non-empty caption uses the same limit.
 - One outbound image per send (png, jpeg, gif, webp, heic, heif, max 25 MiB). Echo the previewed image identity. Do not invent a path or hash.
 - Recipient must not be on `contacts/blocked_chats.txt`.
@@ -340,7 +342,9 @@ Text-only sends embed `text` in the AppleScript. Image sends stage a private cop
    - Whether `blocked: true` (if so, stop—don't prompt for approval)
 3. **Wait for explicit user approval in the chat.** Do not proceed without confirmation.
 4. **Issue `send` with the `send_nonce` from step 2.** The `to`, `text`, and `service` must match the preview exactly. For an image, echo `preview.image` unchanged and show the user the filename, type, size, and path before asking them to approve.
-5. **The helper will display a native macOS dialog** for final confirmation. Image sends title it **Image Send** and list the filename, type, size, and path. The user must click **Send** in this system dialog.
+5. **Finish according to `status.native_confirm`.**
+   - `required` (default): the helper displays a native macOS dialog. Image sends title it **Image Send** and list the filename, type, size, and path. The user must click **Send**. Tell them that dialog is coming.
+   - `skip`: do not mention a Mac dialog. A valid `send` after the chat yes goes straight to Messages.
 6. **If the chat approval takes >60s,** or the image file changes, re-run `send_preview` to mint a fresh nonce.
 7. **Surface `sent.sent_at`, the resolved name, and `sent.image` when present** as confirmation.
 

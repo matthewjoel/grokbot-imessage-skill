@@ -5,7 +5,7 @@
     "host_display_name": "Grok Bot",
     "wrapper_name": "grokbot-imessage-helper",
     "confirmation_name": "grokbot-imessage-confirm",
-    "helper_version": "1.5.0",
+    "helper_version": "1.6.0",
     "product_id": "grokbot-imessage",
     "launchd_label": "com.jeffhuber.grokbot-imessage"
   },
@@ -19,7 +19,7 @@
       "logical_name": "helper.py",
       "path": "bin/helper.py",
       "normalization": "identity",
-      "sha256": "87e90607b57ccd0683392d75096020a9da611b059739efe530a529e569820682"
+      "sha256": "ee29e10747dd80840ebb8789d8644d01593791be43324fcb73e74adca467493a"
     },
     {
       "logical_name": "send_gate.py",

@@ -128,11 +128,13 @@ This is the primary trust boundary you need to understand.
     any non-blocked content; hardened mode limits results to the root-owned
     allowlist.
   - Issue a `send_preview` request, read its nonce, and issue the matching
-    `send` request. This can reach the native confirmation dialog, but it
-    cannot silently send: the user must still review the displayed
-    recipient and message and click **Send**. The approved payload is passed
+    `send` request. With the default native confirmation dialog, it cannot
+    silently send: the user must still review the displayed recipient and
+    message and click **Send**. The approved payload is passed
     integrity-preserved to AppleScript, so the transmitted message matches the
-    dialog exactly (the tempfile race has been closed in v1.4.1+).
+    dialog exactly (the tempfile race has been closed in v1.4.1+). If
+    `contacts/native_confirm.txt` is `skip`, that same local process can
+    complete the send without a Mac dialog. See the fork opt-in below.
 
 Read requests are not tied to an interactive user session. Hardened mode narrows
 the maximum disclosure to explicitly allowlisted chats, but any same-user process
@@ -166,41 +168,59 @@ Sending is confirmation-gated via a two-layer preview/confirm protocol:
 5. Cancel is the keyboard default. You must deliberately select **Send** to proceed. Clicking **Cancel** or waiting
    60 seconds aborts the send.
 
+**Fork opt-in: skip layer 2**
+
+`<policy-dir>/native_confirm.txt` may contain `skip` (DIY path:
+`<bridge-folder>/contacts/native_confirm.txt`). After the nonce check, the
+helper then does not run `grokbot-imessage-confirm`. Chat approval is the
+human gate. The file is absent by default, which keeps the dialog.
+Unrecognized contents, a symlink, another user's file, and a
+group/world-writable file stay on `required`. `status.native_confirm`
+reports the active mode.
+
+`skip` is a deliberate weakening of the local-attacker story. A same-UID
+process that can read and write the bridge can mint a nonce and send with
+no Mac dialog. Nonce TTL, single-use, payload match, the blocklist,
+group-chat rejection, and image fingerprint checks still run. Leave the
+file unset unless that tradeoff is what you want. Enabling it does not
+require rebuilding the confirm binary or the FDA wrapper.
+
 **Layer 3: Integrity-preserving AppleScript invocation**
 
-6. After the dialog is confirmed, the helper passes the approved message body
+6. After the dialog is confirmed — or immediately after the nonce check when
+   native confirm is `skip` — the helper passes the approved message body
    directly to `osascript` embedded in the AppleScript code with proper escaping
    (backslash and double-quote only). This eliminates the tempfile pathname handoff
    that existed in earlier versions, closing the TOCTOU race where a malicious
    same-UID process could replace the tempfile between write and AppleScript read.
    The approved body reaches Messages.app integrity-preserved with no mutable
-   pathname step — the same Python `text` variable validated in Layer 1 and shown
-   in Layer 2 is embedded in the AppleScript, so transmitted bytes match the
-   dialog exactly.
+   pathname step — the same Python `text` variable validated in Layer 1 (and
+   shown in Layer 2 when the dialog is on) is embedded in the AppleScript.
 
-   Image bytes cannot be embedded in AppleScript. After confirmation the helper
+   Image bytes cannot be embedded in AppleScript. After that approval step the helper
    re-reads the file descriptor it fingerprinted, copies those bytes into a
    mode-`0700` temporary directory, hashes the copy, and passes only that staged
    path to Messages. The staged file is removed when `osascript` returns. A
    same-UID process that can replace the staged file in the interval after the
    hash check and before Messages reads it could still swap bytes; that is the
-   same local-user attacker who can already write bridge requests. The dialog
-   remains the approval boundary, and a change to the original file before
-   confirmation is rejected.
+   same local-user attacker who can already write bridge requests. A change to
+   the original file before send is rejected. When the dialog is on, it remains
+   the last approval boundary.
 
 This three-layer gate is enforced **helper-side**. A process that writes
 directly to the bridge folder and issues a `send` with no nonce, a forged
 nonce, a replayed (already-consumed) nonce, an expired nonce (TTL is 60
 seconds), or a nonce whose bound payload differs from the `send` request's
 `(to, text, service)` — plus image path, filename, MIME type, size, and
-sha256 when an image is attached — is rejected before the dialog appears. Nonces are stored as per-file records under `<bridge-folder>/nonces/`; the nonce directory is mode `700` and nonce files are mode `600`. Nonces are single-use (deleted on consume) and are also deleted on validation failure so the same nonce cannot be retried with a corrected payload.
+sha256 when an image is attached — is rejected before the dialog appears and before Messages is contacted. Nonces are stored as per-file records under `<bridge-folder>/nonces/`; the nonce directory is mode `700` and nonce files are mode `600`. Nonces are single-use (deleted on consume) and are also deleted on validation failure so the same nonce cannot be retried with a corrected payload.
 
 An attacker who can write to and read from the bridge can mint its own preview
 nonce; the nonce is not an authorization boundary against that attacker. It
 still prevents a blind one-request send, replay, or swapping the payload after a
-preview. To complete any attacker-created send, the victim must deliberately
-click **Send** in the native dialog showing the exact recipient, service, and
+preview. With the default dialog, completing an attacker-created send still
+requires the victim to click **Send** on the exact recipient, service, and
 complete message body (and, for an image, the filename, type, size, and path).
+With `native_confirm` set to `skip`, that click is not required.
 The approved text body is then passed integrity-preserved to AppleScript (same
 Python `text` variable, no mutable pathname). Image bytes are the fingerprinted
 copy described above. Unexpected dialogs should always be cancelled.
